@@ -25,5 +25,5 @@ export class User {
   updatedAt: Date;
 
   @DeleteDateColumn({ name: 'deleted_at', nullable: true, select: false })
-  deletedAt: Date;
+  deletedAt: Date | null;
 }
