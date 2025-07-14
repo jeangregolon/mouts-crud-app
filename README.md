@@ -97,6 +97,12 @@ npm run dev
 
 - Documentação da API: http://localhost:3000/api (Swagger)
 
+### 8. Testes unitários (Jest)
+```bash
+cd backend
+npx jest
+```
+
 # 🚀 Próximos Passos (Melhorias Futuras)
 Se houvesse mais tempo para desenvolvimento, estas seriam as principais melhorias a serem implementadas:
 
