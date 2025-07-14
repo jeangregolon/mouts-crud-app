@@ -110,7 +110,7 @@ export class UsersService {
 
   private async cacheUser(user: User): Promise<void> {
     const cacheKey = this.getUserCacheKey(user.id);
-    await this.cacheManager.set(cacheKey, user, this.USER_CACHE_TTL * 1000);
+    await this.cacheManager.set(cacheKey, user, this.USER_CACHE_TTL);
   }
 
   private async clearUserCache(id: number): Promise<void> {

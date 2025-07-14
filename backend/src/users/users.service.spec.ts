@@ -1,34 +1,47 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import { UsersService } from './users.service';
+import { Repository, UpdateResult } from 'typeorm';
 import { User } from './user.entity';
+import { UsersService } from './users.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
-import { Repository } from 'typeorm';
-import { Cache } from 'cache-manager';
 import { ConflictException, NotFoundException } from '@nestjs/common';
 
 describe('UsersService', () => {
   let service: UsersService;
   let userRepository: Repository<User>;
-  let cacheManager: Cache;
+  let cacheManager: any;
 
   const mockUser: User = {
     id: 1,
     name: 'Test User',
     email: 'test@example.com',
+    deletedAt: null,
     createdAt: new Date(),
     updatedAt: new Date(),
-    deletedAt: null
   };
 
-  const mockDeletedUser = {
+  const mockDeletedUser: User = {
     ...mockUser,
-    deletedAt: new Date()
+    name: 'Deleted User',
+    email: 'deleted@example.com',
+    deletedAt: new Date(),
+  };
+
+  const mockUpdateResult: UpdateResult = {
+    affected: 1,
+    raw: {},
+    generatedMaps: [],
   };
 
   beforeEach(async () => {
+    cacheManager = {
+      get: jest.fn(),
+      set: jest.fn(),
+      del: jest.fn(),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         UsersService,
@@ -37,58 +50,95 @@ describe('UsersService', () => {
           useValue: {
             findOne: jest.fn(),
             find: jest.fn(),
-            create: jest.fn(),
-            save: jest.fn(),
-            preload: jest.fn(),
-            restore: jest.fn(),
-            softDelete: jest.fn()
-          }
+            create: jest.fn().mockImplementation((dto) => ({
+              ...dto,
+              id: 1,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+              deletedAt: null,
+            })),
+            save: jest.fn().mockImplementation((user) => Promise.resolve(user)),
+            merge: jest.fn().mockImplementation((target, source) => ({ ...target, ...source })),
+            softDelete: jest.fn().mockResolvedValue(mockUpdateResult),
+            restore: jest.fn().mockResolvedValue(mockUpdateResult),
+          },
         },
         {
           provide: CACHE_MANAGER,
-          useValue: {
-            get: jest.fn(),
-            set: jest.fn(),
-            del: jest.fn()
-          }
-        }
-      ]
+          useValue: cacheManager,
+        },
+      ],
     }).compile();
 
     service = module.get<UsersService>(UsersService);
     userRepository = module.get<Repository<User>>(getRepositoryToken(User));
-    cacheManager = module.get<Cache>(CACHE_MANAGER);
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
   });
 
   describe('create', () => {
     it('should create a new user', async () => {
       const createUserDto: CreateUserDto = {
-        name: 'New User',
-        email: 'new@example.com'
+        name: 'Test User',
+        email: 'test@example.com',
       };
 
       jest.spyOn(userRepository, 'findOne').mockResolvedValue(null);
-      jest.spyOn(userRepository, 'create').mockReturnValue(mockUser);
-      jest.spyOn(userRepository, 'save').mockResolvedValue(mockUser);
-
       const result = await service.create(createUserDto);
-      expect(result).toEqual(mockUser);
+
       expect(userRepository.findOne).toHaveBeenCalledWith({
         where: { email: createUserDto.email },
-        withDeleted: true
+        withDeleted: true,
       });
       expect(userRepository.create).toHaveBeenCalledWith(createUserDto);
+      expect(userRepository.save).toHaveBeenCalled();
+      expect(cacheManager.set).toHaveBeenCalled();
+      expect(cacheManager.del).toHaveBeenCalledWith('all_users');
+      expect(result).toEqual(expect.objectContaining({
+        id: expect.any(Number),
+        name: createUserDto.name,
+        email: createUserDto.email,
+        createdAt: expect.any(Date),
+        updatedAt: expect.any(Date),
+      }));
     });
 
-    it('should throw ConflictException for existing active user', async () => {
+    it('should throw ConflictException if email is already in use', async () => {
       const createUserDto: CreateUserDto = {
         name: 'Test User',
-        email: 'test@example.com'
+        email: 'test@example.com',
       };
 
       jest.spyOn(userRepository, 'findOne').mockResolvedValue(mockUser);
 
       await expect(service.create(createUserDto)).rejects.toThrow(ConflictException);
+    });
+
+    it('should restore and update a soft-deleted user with same email', async () => {
+      const createUserDto: CreateUserDto = {
+        name: 'Restored User',
+        email: 'deleted@example.com',
+      };
+
+      const updatedUser = {
+        ...mockDeletedUser,
+        ...createUserDto,
+        deletedAt: null,
+      };
+
+      jest.spyOn(userRepository, 'findOne').mockResolvedValue(mockDeletedUser);
+      jest.spyOn(userRepository, 'save').mockResolvedValue(updatedUser);
+
+      const result = await service.create(createUserDto);
+
+      expect(userRepository.restore).toHaveBeenCalledWith(mockDeletedUser.id);
+      expect(userRepository.save).toHaveBeenCalledWith({
+        ...mockDeletedUser,
+        ...createUserDto,
+      });
+      expect(result).toEqual(updatedUser);
     });
   });
 
@@ -98,96 +148,141 @@ describe('UsersService', () => {
       jest.spyOn(cacheManager, 'get').mockResolvedValue(cachedUsers);
 
       const result = await service.findAll();
-      expect(result).toEqual(cachedUsers);
+
       expect(cacheManager.get).toHaveBeenCalledWith('all_users');
+      expect(userRepository.find).not.toHaveBeenCalled();
+      expect(result).toEqual(cachedUsers);
     });
 
-    it('should fetch from database and cache when no cache', async () => {
+    it('should fetch from database and cache if not in cache', async () => {
       const users = [mockUser];
       jest.spyOn(cacheManager, 'get').mockResolvedValue(null);
       jest.spyOn(userRepository, 'find').mockResolvedValue(users);
-      jest.spyOn(cacheManager, 'set').mockResolvedValue(undefined);
 
       const result = await service.findAll();
-      expect(result).toEqual(users);
+
+      expect(cacheManager.get).toHaveBeenCalledWith('all_users');
       expect(userRepository.find).toHaveBeenCalled();
-      expect(cacheManager.set).toHaveBeenCalledWith('all_users', users, 600000);
+      expect(cacheManager.set).toHaveBeenCalledWith(
+        'all_users',
+        users,
+        300000,
+      );
+      expect(result).toEqual(users);
     });
   });
 
   describe('findOne', () => {
     it('should return cached user if available', async () => {
-      const cacheKey = `user_${mockUser.id}`;
       jest.spyOn(cacheManager, 'get').mockResolvedValue(mockUser);
 
-      const result = await service.findOne(mockUser.id);
+      const result = await service.findOne(1);
+
+      expect(cacheManager.get).toHaveBeenCalledWith('user_1');
+      expect(userRepository.findOne).not.toHaveBeenCalled();
       expect(result).toEqual(mockUser);
-      expect(cacheManager.get).toHaveBeenCalledWith(cacheKey);
     });
 
-    it('should fetch from database, cache and return user', async () => {
-      const cacheKey = `user_${mockUser.id}`;
+    it('should fetch from database and cache if not in cache', async () => {
       jest.spyOn(cacheManager, 'get').mockResolvedValue(null);
       jest.spyOn(userRepository, 'findOne').mockResolvedValue(mockUser);
-      jest.spyOn(cacheManager, 'set').mockResolvedValue(undefined);
 
-      const result = await service.findOne(mockUser.id);
+      const result = await service.findOne(1);
+
+      expect(cacheManager.get).toHaveBeenCalledWith('user_1');
+      expect(userRepository.findOne).toHaveBeenCalledWith({ where: { id: 1 } });
+      expect(cacheManager.set).toHaveBeenCalledWith(
+        'user_1',
+        mockUser,
+        300000,
+      );
       expect(result).toEqual(mockUser);
-      expect(userRepository.findOne).toHaveBeenCalledWith({ where: { id: mockUser.id } });
-      expect(cacheManager.set).toHaveBeenCalledWith(cacheKey, mockUser, 600000);
     });
 
     it('should throw NotFoundException if user not found', async () => {
       jest.spyOn(cacheManager, 'get').mockResolvedValue(null);
       jest.spyOn(userRepository, 'findOne').mockResolvedValue(null);
 
-      await expect(service.findOne(999)).rejects.toThrow(NotFoundException);
+      await expect(service.findOne(1)).rejects.toThrow(NotFoundException);
     });
   });
 
   describe('update', () => {
-    const updateUserDto: UpdateUserDto = {
-      name: 'Updated Name'
-    };
-
-    it('should update user and clear cache', async () => {
+    it('should update an existing user', async () => {
+      const updateUserDto: UpdateUserDto = { name: 'Updated User' };
       const updatedUser = { ...mockUser, ...updateUserDto };
-      jest.spyOn(cacheManager, 'del').mockResolvedValue(true);
-      jest.spyOn(userRepository, 'preload').mockResolvedValue(updatedUser);
+
+      jest.spyOn(userRepository, 'findOne').mockResolvedValue(mockUser);
       jest.spyOn(userRepository, 'save').mockResolvedValue(updatedUser);
 
-      const result = await service.update(mockUser.id, updateUserDto);
-      expect(result).toEqual(updatedUser);
-      expect(cacheManager.del).toHaveBeenCalledWith(`user_${mockUser.id}`);
-      expect(cacheManager.del).toHaveBeenCalledWith('all_users');
-      expect(userRepository.preload).toHaveBeenCalledWith({
-        id: mockUser.id,
-        ...updateUserDto
+      const result = await service.update(1, updateUserDto);
+
+      expect(userRepository.findOne).toHaveBeenCalledWith({
+        where: { id: 1 },
+        withDeleted: true,
       });
+      expect(cacheManager.del).toHaveBeenCalledWith('user_1');
+      expect(cacheManager.del).toHaveBeenCalledWith('all_users');
+      expect(userRepository.merge).toHaveBeenCalledWith(mockUser, updateUserDto);
+      expect(userRepository.save).toHaveBeenCalledWith(updatedUser);
+      expect(cacheManager.set).toHaveBeenCalledWith(
+        'user_1',
+        updatedUser,
+        300000,
+      );
+      expect(result).toEqual(updatedUser);
     });
 
     it('should throw NotFoundException if user not found', async () => {
-      jest.spyOn(userRepository, 'preload').mockResolvedValue(undefined);
+      const updateUserDto: UpdateUserDto = { name: 'Updated User' };
+      jest.spyOn(userRepository, 'findOne').mockResolvedValue(null);
 
-      await expect(service.update(999, updateUserDto)).rejects.toThrow(NotFoundException);
+      await expect(service.update(1, updateUserDto)).rejects.toThrow(NotFoundException);
     });
   });
 
   describe('remove', () => {
-    it('should soft delete user and clear cache', async () => {
-      jest.spyOn(cacheManager, 'del').mockResolvedValue(true);
-      jest.spyOn(userRepository, 'softDelete').mockResolvedValue({ affected: 1 } as any);
+    it('should soft delete an existing user', async () => {
+      jest.spyOn(userRepository, 'softDelete').mockResolvedValue(mockUpdateResult);
 
-      await service.remove(mockUser.id);
-      expect(cacheManager.del).toHaveBeenCalledWith(`user_${mockUser.id}`);
+      await service.remove(1);
+
+      expect(cacheManager.del).toHaveBeenCalledWith('user_1');
       expect(cacheManager.del).toHaveBeenCalledWith('all_users');
-      expect(userRepository.softDelete).toHaveBeenCalledWith(mockUser.id);
+      expect(userRepository.softDelete).toHaveBeenCalledWith(1);
     });
 
     it('should throw NotFoundException if user not found', async () => {
-      jest.spyOn(userRepository, 'softDelete').mockResolvedValue({ affected: 0 } as any);
+      jest.spyOn(userRepository, 'softDelete').mockResolvedValue({ ...mockUpdateResult, affected: 0 });
 
-      await expect(service.remove(999)).rejects.toThrow(NotFoundException);
+      await expect(service.remove(1)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('cache methods', () => {
+    it('should generate correct cache key', () => {
+      const key = service['getUserCacheKey'](1);
+      expect(key).toBe('user_1');
+    });
+
+    it('should clear user cache', async () => {
+      await service['clearUserCache'](1);
+      expect(cacheManager.del).toHaveBeenCalledWith('user_1');
+      expect(cacheManager.del).toHaveBeenCalledWith('all_users');
+    });
+
+    it('should invalidate all users cache', async () => {
+      await service['invalidateAllUsersCache']();
+      expect(cacheManager.del).toHaveBeenCalledWith('all_users');
+    });
+
+    it('should cache user', async () => {
+      await service['cacheUser'](mockUser);
+      expect(cacheManager.set).toHaveBeenCalledWith(
+        'user_1',
+        mockUser,
+        300000,
+      );
     });
   });
 });

@@ -35,7 +35,7 @@ import { redisStore } from 'cache-manager-redis-store';
             host: config.getOrThrow<string>('REDIS_HOST'),
             port: config.getOrThrow<number>('REDIS_PORT'),
           },
-          ttl: config.get<number>('REDIS_TTL', 60) * 1000, 
+          ttl: config.get<number>('REDIS_TTL', 60), 
         }),
       }),
     }),
